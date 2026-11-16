@@ -36,6 +36,12 @@
     <key name="cover-size" type="i">
       <default>256</default>
     </key>
+    <key name="sort-by" type="s">
+      <default>'recent'</default>
+    </key>
+    <key name="sort-reverse" type="b">
+      <default>false</default>
+    </key>
   </schema>
 
   <schema id="com.github.johnfactotum.Foliate.viewer"

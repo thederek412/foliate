@@ -102,12 +102,24 @@ const getURIFromTracker = identifier => {
 
 const showCovers = utils.settings('library')?.get_boolean('show-covers') ?? true
 
+const sortModes = ['recent', 'added', 'title', 'author']
+const normalizeSortMode = value => sortModes.includes(value) ? value : 'recent'
+
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
+
 const listBooks = function* (path) {
-    const ls = utils.listDir(path, 'standard::name,time::modified')
+    const ls = utils.listDir(path, 'standard::name,time::modified,time::created')
     for (const { file, name, info } of ls) try {
         if (!/\.json$/.test(name)) continue
-        const modified = new Date(info.get_attribute_uint64('time::modified') * 1000)
-        yield { file, modified }
+        const modified = info.get_attribute_uint64('time::modified') * 1000
+        const created = info.has_attribute('time::created')
+            ? info.get_attribute_uint64('time::created') * 1000
+            : 0
+        yield {
+            file,
+            modified: new Date(modified),
+            created: new Date(created || modified),
+        }
     } catch (e) {
         console.error(e)
     }
@@ -139,12 +151,16 @@ export const getURIStore = utils.memoize(() => new URIStore())
 
 const BookList = GObject.registerClass({
     GTypeName: 'FoliateBookList',
+    Signals: {
+        'resorted': {},
+    },
 }, class extends Gio.ListStore {
     #uriStore = getURIStore()
-    #files = Array.from(listBooks(pkg.datadir) ?? [])
-        .sort((a, b) => b.modified - a.modified)
-        .map(x => x.file)
-    #iter = this.#files.values()
+    #entries = Array.from(listBooks(pkg.datadir) ?? [])
+    #loaded = new Set()
+    #cursor = 0
+    #sortBy = 'recent'
+    #reverse = false
     constructor(params) {
         super(params)
         this.readFile = utils.memoize(utils.readJSONFile)
@@ -153,13 +169,93 @@ const BookList = GObject.registerClass({
             try { return GdkPixbuf.Pixbuf.new_from_file(path) }
             catch { return null }
         })
+        this.#sortEntries()
+    }
+    #metadata(entry) {
+        return this.readFile(entry.file)?.metadata ?? {}
+    }
+    #title(entry) {
+        if (entry.title === undefined)
+            entry.title = formatLanguageMap(this.#metadata(entry).title)
+        return entry.title
+    }
+    #author(entry) {
+        if (entry.author === undefined)
+            entry.author = formatAuthors(this.#metadata(entry))
+        return entry.author
+    }
+    #compare(a, b) {
+        const byTitle = this.#sortBy === 'title'
+        const byAuthor = this.#sortBy === 'author'
+        if (byTitle || byAuthor) {
+            const x = (byTitle ? this.#title(a) : this.#author(a)).trim()
+            const y = (byTitle ? this.#title(b) : this.#author(b)).trim()
+            if (!x || !y) return !x && !y ? 0 : !x ? 1 : -1
+            let result = collator.compare(x, y)
+            if (result === 0 && byAuthor)
+                result = collator.compare(this.#title(a), this.#title(b))
+            if (this.#reverse) result = -result
+            return result || collator.compare(a.file.get_basename(), b.file.get_basename())
+        }
+        const key = entry => this.#sortBy === 'added' ? entry.created : entry.modified
+        let result = key(b) - key(a) // newest first
+        if (this.#reverse) result = -result
+        return result || collator.compare(a.file.get_basename(), b.file.get_basename())
+    }
+    #sortEntries() {
+        this.#entries.sort((a, b) => this.#compare(a, b))
+    }
+    #remove(path) {
+        for (let i = this.get_n_items() - 1; i >= 0; i--)
+            if (this.get_item(i)?.get_path() === path) this.remove(i)
+    }
+    #makeEntry(file) {
+        let modified = new Date(), created
+        try {
+            const info = file.query_info('time::modified,time::created',
+                Gio.FileQueryInfoFlags.NONE, null)
+            modified = new Date(info.get_attribute_uint64('time::modified') * 1000)
+            if (info.has_attribute('time::created')) {
+                const t = info.get_attribute_uint64('time::created')
+                if (t) created = new Date(t * 1000)
+            }
+        } catch (e) {
+            console.debug(e)
+        }
+        return { file, modified, created: created ?? modified }
+    }
+    #rebuild() {
+        const n = this.get_n_items()
+        this.remove_all()
+        this.#loaded.clear()
+        this.#cursor = 0
+        if (n) this.loadMore(n)
+        this.emit('resorted')
+    }
+    setSort(sortBy, reverse) {
+        sortBy = normalizeSortMode(sortBy)
+        reverse = !!reverse
+        if (sortBy === this.#sortBy && reverse === this.#reverse) return
+        this.#sortBy = sortBy
+        this.#reverse = reverse
+        this.#sortEntries()
+        if (this.get_n_items()) this.#rebuild()
     }
     loadMore(n) {
         for (let i = 0; i < n; i++) {
-            const { value, done } = this.#iter.next()
-            if (done) return true
-            else if (value) this.append(value)
+            let appended = false
+            while (this.#cursor < this.#entries.length) {
+                const entry = this.#entries[this.#cursor++]
+                const path = entry.file.get_path()
+                if (this.#loaded.has(path)) continue
+                this.#loaded.add(path)
+                this.append(entry.file)
+                appended = true
+                break
+            }
+            if (!appended) return true
         }
+        return false
     }
     getBook(file) {
         const { identifier } = this.readFile(file)?.metadata ?? {}
@@ -175,18 +271,31 @@ const BookList = GObject.registerClass({
         const name = file.get_basename()
         const cover = Gio.File.new_for_path(pkg.cachepath(name.replace('.json', '.png')))
         const id = decodeURIComponent(name.replace('.json', ''))
+        const path = file.get_path()
         this.#uriStore.delete(id)
         for (const f of [file, cover]) try { f.delete(null) } catch {}
-        for (const [i, el] of utils.gliter(this)) if (el === file) this.remove(i)
+        const i = this.#entries.findIndex(x => x.file.get_path() === path)
+        if (i !== -1) {
+            this.#entries.splice(i, 1)
+            if (i < this.#cursor) this.#cursor--
+        }
+        this.#loaded.delete(path)
+        this.#remove(path)
     }
     update(path) {
-        // remove it from the queue if it's not yet loaded
-        const i = this.#files.findIndex(f => f?.get_path() === path)
-        // set to null instead of removing it so we don't mess up the iterator
-        if (i !== -1) this.#files[i] = null
-        // remove it from the list if it has been loaded
-        for (const [i, el] of utils.gliter(this)) if (el.get_path() === path) this.remove(i)
-        this.insert(0, Gio.File.new_for_path(path))
+        const entry = this.#entries.find(x => x.file.get_path() === path)
+        if (!entry) {
+            this.#entries.push(this.#makeEntry(Gio.File.new_for_path(path)))
+            this.#sortEntries()
+            this.#rebuild()
+            return
+        }
+        entry.modified = new Date()
+        if (this.#sortBy !== 'recent') return
+        this.#remove(path)
+        this.#loaded.delete(path)
+        this.insert(0, entry.file)
+        this.#loaded.add(path)
     }
 })
 
@@ -314,6 +423,8 @@ GObject.registerClass({
     InternalChildren: ['scrolled'],
     Properties: utils.makeParams({
         'view-mode': 'string',
+        'sort-by': 'string',
+        'sort-reverse': 'boolean',
     }),
     Signals: {
         'load-more': { return_type: GObject.TYPE_BOOLEAN },
@@ -322,6 +433,8 @@ GObject.registerClass({
     },
 }, class extends Gtk.Stack {
     #done = false
+    #model
+    #resortHandler
     #filter = new Gtk.CustomFilter()
     #filterModel = utils.connect(new Gtk.FilterListModel({ filter: this.#filter }),
         { 'items-changed': () => this.#update() })
@@ -341,7 +454,7 @@ GObject.registerClass({
         'open-external-app': (_, file) => this.openWithExternalApp(getBooks().getBook(file)),
     }
     actionGroup = utils.addMethods(this, {
-        props: ['view-mode'],
+        props: ['view-mode', 'sort-by', 'sort-reverse'],
     })
     constructor(params) {
         super(params)
@@ -351,6 +464,9 @@ GObject.registerClass({
         })
         const show = () => this.view_mode === 'list' ? this.showList() : this.showGrid()
         this.connect('notify::view-mode', show)
+        const applySort = () => getBookList()?.setSort(this.sort_by, this.sort_reverse)
+        this.connect('notify::sort-by', applySort)
+        this.connect('notify::sort-reverse', applySort)
         show()
     }
     #checkAdjustment(adj) {
@@ -367,6 +483,12 @@ GObject.registerClass({
     }
     setModel(model) {
         this.#filterModel.model = model
+        this.#model?.disconnect(this.#resortHandler)
+        this.#resortHandler = model.connect('resorted', () => {
+            this.#done = false
+            this._scrolled.vadjustment.value = 0
+        })
+        this.#model = model
         this.#update()
     }
     showGrid() {
@@ -900,7 +1022,13 @@ export const Library = GObject.registerClass({
         })
         this._books_view.setModel(books)
         this._books_view.view_mode = 'grid'
-        utils.bindSettings('library', this._books_view, ['view-mode'])
+        const settings = utils.settings('library')
+        if (settings?.settings_schema?.has_key('sort-by'))
+            this._books_view.sort_by = settings.get_string('sort-by')
+        if (settings?.settings_schema?.has_key('sort-reverse'))
+            this._books_view.sort_reverse = settings.get_boolean('sort-reverse')
+        utils.bindSettings('library', this._books_view,
+            ['view-mode', 'sort-by', 'sort-reverse'])
         books.loadMore(10)
 
         this._search_bar.connect_entry(this._search_entry)

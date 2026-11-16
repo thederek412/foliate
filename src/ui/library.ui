@@ -14,6 +14,36 @@
     </item>
   </section>
 </menu>
+<menu id="library-sort-menu">
+  <section>
+    <item>
+      <attribute name="label" translatable="yes">Recently Read</attribute>
+      <attribute name="action">library.sort-by</attribute>
+      <attribute name="target">recent</attribute>
+    </item>
+    <item>
+      <attribute name="label" translatable="yes">Date Added</attribute>
+      <attribute name="action">library.sort-by</attribute>
+      <attribute name="target">added</attribute>
+    </item>
+    <item>
+      <attribute name="label" translatable="yes">Title</attribute>
+      <attribute name="action">library.sort-by</attribute>
+      <attribute name="target">title</attribute>
+    </item>
+    <item>
+      <attribute name="label" translatable="yes">Author</attribute>
+      <attribute name="action">library.sort-by</attribute>
+      <attribute name="target">author</attribute>
+    </item>
+  </section>
+  <section>
+    <item>
+      <attribute name="label" translatable="yes">Reverse Order</attribute>
+      <attribute name="action">library.sort-reverse</attribute>
+    </item>
+  </section>
+</menu>
 <menu id="primary-menu">
   <section>
     <item>
@@ -116,6 +146,13 @@
                           <property name="icon-name">view-more-symbolic</property>
                           <property name="tooltip-text" translatable="yes">Library Menu</property>
                           <property name="menu-model">library-menu</property>
+                        </object>
+                      </child>
+                      <child type="end">
+                        <object class="GtkMenuButton">
+                          <property name="icon-name">view-sort-ascending-symbolic</property>
+                          <property name="tooltip-text" translatable="yes">Sort</property>
+                          <property name="menu-model">library-sort-menu</property>
                         </object>
                       </child>
                       <child type="end">
