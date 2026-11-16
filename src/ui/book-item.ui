@@ -48,6 +48,16 @@
       </object>
     </child>
     <child>
+      <object class="GtkInscription" id="author">
+        <property name="text-overflow">ellipsize-end</property>
+        <property name="min-lines">1</property>
+        <property name="nat-lines">1</property>
+        <property name="margin-top">3</property>
+        <style><class name="dim-label"/></style>
+        <style><class name="caption"/></style>
+      </object>
+    </child>
+    <child>
       <object class="GtkBox">
         <child>
           <object class="GtkLabel" id="progress">

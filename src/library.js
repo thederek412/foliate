@@ -333,7 +333,7 @@ const fraction = p => p?.[1] ? (p[0] + 1) / (p[1] + 1) : null
 const BookItem = GObject.registerClass({
     GTypeName: 'FoliateBookItem',
     Template: pkg.moduleuri('ui/book-item.ui'),
-    InternalChildren: ['image', 'progress', 'title'],
+    InternalChildren: ['image', 'progress', 'title', 'author'],
     Signals: {
         'open-new-window': { param_types: [Gio.File.$gtype] },
         'remove-book': { param_types: [Gio.File.$gtype] },
@@ -356,7 +356,10 @@ const BookItem = GObject.registerClass({
     update(item, data, cover) {
         this.#item = item
         const title = formatLanguageMap(data.metadata?.title)
+        const author = formatAuthors(data.metadata)
         this._title.text = title
+        this._author.text = author
+        this._author.visible = !!author
         this._image.load(cover?.then ? null : cover, title)
         this._progress.label = format.percent(fraction(data.progress))
     }
