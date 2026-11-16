@@ -119,7 +119,7 @@
                   <child type="top">
                     <object class="AdwHeaderBar">
                       <property name="title-widget">
-                        <object class="GtkLabel">
+                        <object class="GtkLabel" id="library-title">
                           <property name="label" translatable="yes">Library</property>
                           <property name="single-line-mode">True</property>
                           <property name="ellipsize">end</property>

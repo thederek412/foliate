@@ -107,6 +107,47 @@ const normalizeSortMode = value => sortModes.includes(value) ? value : 'recent'
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
 
+const uncategorized = '__uncategorized__'
+
+const resolveBookPath = uri => {
+    if (!uri) return null
+    try {
+        if (uri.startsWith('file://'))
+            return Gio.File.new_for_uri(uri).get_path()
+        if (uri.startsWith('/'))
+            return uri
+        if (uri.startsWith('~'))
+            return uri.replace('~', GLib.get_home_dir())
+    } catch (e) {
+        console.debug(e)
+    }
+    return null
+}
+
+// find the deepest directory that contains at least 90% of the books
+const findCollectionRoot = paths => {
+    const split = paths.map(path => path.split('/').filter(Boolean))
+    if (!split.length) return null
+    const base = split[0]
+    const min = Math.ceil(split.length * 0.9)
+    for (let len = base.length - 1; len > 0; len--) {
+        const prefix = base.slice(0, len)
+        const count = split.filter(parts =>
+            prefix.every((name, i) => parts[i] === name)).length
+        if (count >= min) return '/' + prefix.join('/')
+    }
+    return null
+}
+
+const getCollectionDir = (path, root) => {
+    if (!root || !path.startsWith(root + '/')) return null
+    const rel = path.slice(root.length + 1)
+    const i = rel.lastIndexOf('/')
+    if (i === -1) return null
+    const dir = rel.slice(0, i)
+    return dir.split('/').some(name => name.startsWith('!')) ? null : dir
+}
+
 const listBooks = function* (path) {
     const ls = utils.listDir(path, 'standard::name,time::modified,time::created')
     for (const { file, name, info } of ls) try {
@@ -128,6 +169,9 @@ const listBooks = function* (path) {
 class URIStore {
     #storage = new utils.JSONStorage(pkg.datapath('library'), 'uri-store')
     #map = new Map(this.#storage.get('uris'))
+    peek(id) {
+        return this.#map.get(id)
+    }
     get(id) {
         try {
             const uri = getURIFromTracker(id)
@@ -153,6 +197,7 @@ const BookList = GObject.registerClass({
     GTypeName: 'FoliateBookList',
     Signals: {
         'resorted': {},
+        'collections-changed': {},
     },
 }, class extends Gio.ListStore {
     #uriStore = getURIStore()
@@ -161,6 +206,8 @@ const BookList = GObject.registerClass({
     #cursor = 0
     #sortBy = 'recent'
     #reverse = false
+    #collections = []
+    #collectionFiles = new Map()
     constructor(params) {
         super(params)
         this.readFile = utils.memoize(utils.readJSONFile)
@@ -170,6 +217,81 @@ const BookList = GObject.registerClass({
             catch { return null }
         })
         this.#sortEntries()
+        this.#collectionIndex()
+    }
+    #collectionIndex() {
+        this.#collectionFiles = new Map()
+        const paths = new Map()
+        for (const entry of this.#entries) {
+            if (!entry) continue
+            let identifier
+            try {
+                identifier = decodeURIComponent(
+                    entry.file.get_basename().replace(/\.json$/, ''))
+            } catch {
+                continue
+            }
+            const path = resolveBookPath(this.#uriStore.peek(identifier))
+            if (path) paths.set(entry, path)
+        }
+        const top = { children: new Map() }
+        const root = findCollectionRoot([...paths.values()])
+        const other = new Set()
+        for (const [entry, path] of paths) {
+            const dir = getCollectionDir(path, root)
+            if (!dir) {
+                other.add(entry.file.get_path())
+                continue
+            }
+            const parts = dir.split('/')
+            let node = top
+            for (let i = 0; i < parts.length; i++) {
+                const name = parts[i]
+                let child = node.children.get(name)
+                if (!child) {
+                    child = {
+                        name,
+                        path: parts.slice(0, i + 1).join('/'),
+                        count: 0,
+                        children: new Map(),
+                    }
+                    node.children.set(name, child)
+                }
+                child.count++
+                node = child
+                const files = this.#collectionFiles.get(child.path)
+                if (files) files.add(entry.file.get_path())
+                else this.#collectionFiles.set(child.path,
+                    new Set([entry.file.get_path()]))
+            }
+        }
+        const toList = node => [...node.children.values()]
+            .sort((a, b) => collator.compare(a.name, b.name))
+            .map(child => ({
+                name: child.name,
+                path: child.path,
+                count: child.count,
+                children: toList(child),
+            }))
+        this.#collections = toList(top)
+        if (other.size) {
+            this.#collectionFiles.set(uncategorized, other)
+            this.#collections.push({
+                name: _('Uncategorized'),
+                path: uncategorized,
+                count: other.size,
+                children: [],
+            })
+        }
+    }
+    get collections() {
+        return this.#collections
+    }
+    get total() {
+        return this.#entries.length
+    }
+    getCollectionFiles(path) {
+        return this.#collectionFiles.get(path) ?? null
     }
     #metadata(entry) {
         return this.readFile(entry.file)?.metadata ?? {}
@@ -281,13 +403,17 @@ const BookList = GObject.registerClass({
         }
         this.#loaded.delete(path)
         this.#remove(path)
+        this.#collectionIndex()
+        this.emit('collections-changed')
     }
     update(path) {
         const entry = this.#entries.find(x => x.file.get_path() === path)
         if (!entry) {
             this.#entries.push(this.#makeEntry(Gio.File.new_for_path(path)))
             this.#sortEntries()
+            this.#collectionIndex()
             this.#rebuild()
+            this.emit('collections-changed')
             return
         }
         entry.modified = new Date()
@@ -438,6 +564,8 @@ GObject.registerClass({
     #done = false
     #model
     #resortHandler
+    #collection = null
+    #query = ''
     #filter = new Gtk.CustomFilter()
     #filterModel = utils.connect(new Gtk.FilterListModel({ filter: this.#filter }),
         { 'items-changed': () => this.#update() })
@@ -541,20 +669,38 @@ GObject.registerClass({
         const cover = getCover && identifier ? books.readCover(identifier) : null
         return { cover, data }
     }
-    search(text) {
-        const q = text.trim().toLowerCase()
-        if (!q) {
+    setCollection(path) {
+        this.#collection = path || null
+        this.#done = false
+        this.#applyFilter()
+        this._scrolled.vadjustment.value = 0
+    }
+    #applyFilter() {
+        const q = this.#query
+        const collection = this.#collection
+        if (!q && !collection) {
             this.#filter.set_filter_func(null)
+            this.#update()
             return
         }
         this.emit('load-all')
+        const books = getBooks()
         const fields = ['title', 'creator', 'description']
-        const { readFile } = this.#filterModel.model
         this.#filter.set_filter_func(file => {
-            const { metadata } = readFile(file)
+            if (collection) {
+                const files = books.getCollectionFiles(collection)
+                if (!files?.has(file.get_path())) return false
+            }
+            if (!q) return true
+            const { metadata } = books.readFile(file)
             if (!metadata) return false
             return fields.some(field => matchString(metadata[field], q))
         })
+        this.#update()
+    }
+    search(text) {
+        this.#query = text.trim().toLowerCase()
+        this.#applyFilter()
     }
     removeBook(file) {
         const dialog = new Adw.AlertDialog({
@@ -780,6 +926,10 @@ const SidebarItem = utils.makeDataClass('FoliateSidebarItem', {
     'icon': 'string',
     'label': 'string',
     'value': 'string',
+    'count': 'int',
+    'depth': 'int',
+    'expandable': 'boolean',
+    'expanded': 'boolean',
 })
 
 const SidebarRow = GObject.registerClass({
@@ -789,11 +939,24 @@ const SidebarRow = GObject.registerClass({
     }),
     Signals: {
         'remove-catalog': { param_types: [GObject.TYPE_OBJECT] },
+        'toggle-expand': { param_types: [GObject.TYPE_STRING] },
     },
 }, class extends Gtk.Box {
+    #expander = new Gtk.Button({
+        has_frame: false,
+        valign: Gtk.Align.CENTER,
+        visible: false,
+        width_request: 16,
+    })
     #icon = new Gtk.Image()
     #label = new Gtk.Label({
         ellipsize: Pango.EllipsizeMode.END,
+        hexpand: true,
+        xalign: 0,
+    })
+    #count = new Gtk.Label({
+        xalign: 1,
+        visible: false,
     })
     #menu = new Gio.Menu()
     #popover = new Gtk.PopoverMenu({
@@ -803,14 +966,32 @@ const SidebarRow = GObject.registerClass({
     })
     constructor(params) {
         super(params)
-        this.spacing = 12
-        this.margin_start = 6
+        this.spacing = 8
+        this.margin_start = 6 + (this.item.depth ?? 0) * 16
+        this.#count.add_css_class('dim-label')
+        this.#count.add_css_class('caption')
+        this.append(this.#expander)
         this.append(this.#icon)
         this.append(this.#label)
+        this.append(this.#count)
         this.item.bindProperties({
             icon: [this.#icon, 'icon-name'],
             label: [this.#label, 'label'],
         })
+        if (this.item.expandable) {
+            this.#expander.visible = true
+            this.#expander.icon_name = this.item.expanded
+                ? 'pan-down-symbolic' : 'pan-end-symbolic'
+            this.#expander.connect('clicked', () =>
+                this.emit('toggle-expand', this.item.value))
+        }
+        if (this.item.type === 'collection' || this.item.type === 'library') {
+            this.#count.visible = true
+            const update = () =>
+                this.#count.label = this.item.count ? String(this.item.count) : ''
+            this.item.connect('notify::count', update)
+            update()
+        }
 
         this.insert_action_group('catalog-item', utils.addSimpleActions({
             'rename': () => this.rename(),
@@ -859,6 +1040,7 @@ const SidebarRow = GObject.registerClass({
 
 const sidebarListModel = new Gio.ListStore()
 sidebarListModel.append(new SidebarItem({
+    type: 'library',
     icon: 'library-symbolic',
     label: _('All Books'),
     value: 'library',
@@ -915,13 +1097,19 @@ export const Library = GObject.registerClass({
     InternalChildren: [
         'breakpoint-bin', 'split-view',
         'sidebar-list-box', 'main-stack',
-        'library-toolbar-view', 'catalog-toolbar-view',
+        'library-toolbar-view', 'library-title', 'catalog-toolbar-view',
         'books-view', 'search-bar', 'search-entry',
         'opds-view',
     ],
 }, class extends Gtk.Box {
+    #currentCollection = null
+    #expandedCollections = new Set()
     constructor(params) {
         super(params)
+
+        const books = getBooks()
+        sidebarListModel.get_item(0).count = books.total
+        this.#refreshCollections()
 
         this._breakpoint_bin.add_breakpoint(utils.connect(new Adw.Breakpoint({
             condition: Adw.BreakpointCondition.parse('max-width: 700px'),
@@ -931,22 +1119,20 @@ export const Library = GObject.registerClass({
         }))
 
         this._sidebar_list_box.set_header_func((row, before) => {
-            if (!before)
-                row.set_header(utils.addClass(new Gtk.Label({
-                    label: _('Library'),
-                    xalign: 0,
-                    margin_start: 12,
-                    margin_bottom: 6,
-                }), 'caption-heading', 'dim-label'))
-            if (before && before.child.item.type !== 'catalog'
-            && row.child.item.type === 'catalog')
-                row.set_header(utils.addClass(new Gtk.Label({
-                    label: _('Catalogs'),
-                    xalign: 0,
-                    margin_start: 12,
-                    margin_top: 18,
-                    margin_bottom: 6,
-                }), 'caption-heading', 'dim-label'))
+            const getSection = item => item.type === 'collection' ? 'collections'
+                : item.type === 'catalog' || item.type === 'action' ? 'catalogs'
+                : 'library'
+            const section = getSection(row.child.item)
+            if (before && getSection(before.child.item) === section) return
+            const label = section === 'catalogs' ? _('Catalogs')
+                : section === 'collections' ? _('Collections') : _('Library')
+            row.set_header(utils.addClass(new Gtk.Label({
+                label,
+                xalign: 0,
+                margin_start: 12,
+                margin_top: section === 'library' ? 0 : 18,
+                margin_bottom: 6,
+            }), 'caption-heading', 'dim-label'))
         })
         this._sidebar_list_box.add_controller(utils.connect(Gtk.DropTarget.new(
             SidebarItem.$gtype, Gdk.DragAction.MOVE), {
@@ -991,6 +1177,7 @@ export const Library = GObject.registerClass({
                         uri: item.value,
                     }) }))
                 },
+                'toggle-expand': (_, path) => this.#toggleCollection(path),
             })
             if (item.type === 'catalog') {
                 child.add_controller(utils.connect(new Gtk.DragSource({
@@ -1011,12 +1198,11 @@ export const Library = GObject.registerClass({
         this._sidebar_list_box.connect('row-activated', (__, row) => {
             const { type, value } = row.child.item
             if (value === 'add-catalog') return this.addCatalog().catch(e => console.error(e))
-            if (value === 'library') return this._main_stack.visible_child = this._library_toolbar_view
+            if (type === 'collection') return this.#showCollection(value)
+            if (value === 'library') return this.#showCollection(null)
             if (type === 'catalog') return this.showCatalog(value)
         })
         this._sidebar_list_box.select_row(this._sidebar_list_box.get_row_at_index(0))
-
-        const books = getBooks()
 
         utils.connect(this._books_view, {
             'activate': (_, item) => this.root.openFile(books.getBook(item)),
@@ -1034,12 +1220,75 @@ export const Library = GObject.registerClass({
             ['view-mode', 'sort-by', 'sort-reverse'])
         books.loadMore(10)
 
+        books.connect('collections-changed', () => {
+            sidebarListModel.get_item(0).count = books.total
+            this.#refreshCollections()
+        })
+
         this._search_bar.connect_entry(this._search_entry)
         this._search_entry.connect('search-changed', entry =>
             this._books_view.search(entry.text))
 
         this.insert_action_group('library', this._books_view.actionGroup)
         this.insert_action_group('catalog', this._opds_view.actionGroup)
+    }
+    #collectionRow(path) {
+        for (let i = 0; ; i++) {
+            const row = this._sidebar_list_box.get_row_at_index(i)
+            if (!row) return null
+            if (row.child.item.type === 'collection'
+            && row.child.item.value === path) return row
+        }
+    }
+    #refreshCollections() {
+        for (let i = sidebarListModel.get_n_items() - 1; i >= 0; i--)
+            if (sidebarListModel.get_item(i).type === 'collection')
+                sidebarListModel.remove(i)
+        const rows = []
+        const add = (nodes, depth) => {
+            for (const node of nodes) {
+                const expanded = this.#expandedCollections.has(node.path)
+                rows.push(new SidebarItem({
+                    type: 'collection',
+                    icon: 'folder-symbolic',
+                    label: node.name,
+                    value: node.path,
+                    count: node.count,
+                    depth,
+                    expandable: node.children.length > 0,
+                    expanded,
+                }))
+                if (expanded) add(node.children, depth + 1)
+            }
+        }
+        add(getBooks().collections, 0)
+        for (const [i, item] of rows.entries())
+            sidebarListModel.insert(1 + i, item)
+        if (!this._sidebar_list_box) return
+        if (!this.#currentCollection) return
+        const row = this.#collectionRow(this.#currentCollection)
+        if (row) this._sidebar_list_box.select_row(row)
+        else {
+            this.#currentCollection = null
+            this._books_view.setCollection(null)
+            this._library_title.label = _('Library')
+            this._sidebar_list_box.select_row(this._sidebar_list_box.get_row_at_index(0))
+        }
+    }
+    #toggleCollection(path) {
+        if (this.#expandedCollections.has(path))
+            this.#expandedCollections.delete(path)
+        else this.#expandedCollections.add(path)
+        this.#refreshCollections()
+    }
+    #showCollection(path) {
+        path = path || null
+        this.#currentCollection = path
+        this._main_stack.visible_child = this._library_toolbar_view
+        this._books_view.setCollection(path)
+        this._library_title.label = !path ? _('Library')
+            : path === uncategorized ? _('Uncategorized')
+            : path.split('/').join(' / ')
     }
     #addCatalog(url) {
         this._sidebar_list_box.select_row(null)
